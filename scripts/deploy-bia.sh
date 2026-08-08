@@ -88,6 +88,53 @@ show_service_status() {
     --output table
 }
 
+# ── Buscar IP público da EC2 do cluster ──────────────────────────────────────
+get_cluster_ec2_ip() {
+  info "Buscando instâncias EC2 registradas no cluster ${CLUSTER}..."
+
+  # Lista os ARNs das container instances do cluster
+  CONTAINER_INSTANCE_ARNS=$(aws ecs list-container-instances \
+    --region "$AWS_REGION" \
+    --cluster "$CLUSTER" \
+    --status ACTIVE \
+    --query "containerInstanceArns" \
+    --output json)
+
+  if [[ "$CONTAINER_INSTANCE_ARNS" == "[]" || -z "$CONTAINER_INSTANCE_ARNS" ]]; then
+    error "Nenhuma instância EC2 ativa encontrada no cluster '${CLUSTER}'. Verifique se o cluster está rodando."
+  fi
+
+  # Pega o ARN da primeira instância
+  FIRST_ARN=$(echo "$CONTAINER_INSTANCE_ARNS" | python3 -c "import sys,json; print(json.load(sys.stdin)[0])")
+
+  # Busca o EC2 Instance ID a partir da container instance
+  EC2_INSTANCE_ID=$(aws ecs describe-container-instances \
+    --region "$AWS_REGION" \
+    --cluster "$CLUSTER" \
+    --container-instances "$FIRST_ARN" \
+    --query "containerInstances[0].ec2InstanceId" \
+    --output text)
+
+  if [[ -z "$EC2_INSTANCE_ID" || "$EC2_INSTANCE_ID" == "None" ]]; then
+    error "Não foi possível obter o EC2 Instance ID da container instance do cluster '${CLUSTER}'."
+  fi
+
+  info "EC2 Instance ID encontrado: ${BOLD}${EC2_INSTANCE_ID}${NC}"
+
+  # Busca o IP público da instância EC2
+  EC2_PUBLIC_IP=$(aws ec2 describe-instances \
+    --region "$AWS_REGION" \
+    --instance-ids "$EC2_INSTANCE_ID" \
+    --query "Reservations[0].Instances[0].PublicIpAddress" \
+    --output text)
+
+  if [[ -z "$EC2_PUBLIC_IP" || "$EC2_PUBLIC_IP" == "None" ]]; then
+    error "A instância ${EC2_INSTANCE_ID} não possui IP público. Verifique se a instância está com IP público habilitado."
+  fi
+
+  success "IP público da EC2 do cluster: ${BOLD}${EC2_PUBLIC_IP}${NC}"
+}
+
 # =============================================================================
 # DEPLOY
 # =============================================================================
@@ -115,13 +162,43 @@ do_deploy() {
   read -rp "Confirma o deploy com hash ${COMMIT_HASH} no ambiente ${CLUSTER}? (s/N): " CONFIRM
   [[ "$CONFIRM" =~ ^[sS]$ ]] || { warn "Deploy cancelado."; exit 0; }
 
-  # ── Build da imagem ───────────────────────────────────────────────────────
-  info "Iniciando build da imagem Docker..."
+  # ── Buscar IP público da EC2 do cluster e injetar no Dockerfile ──────────
+  get_cluster_ec2_ip
+
   DOCKERFILE_PATH="$(git rev-parse --show-toplevel)/Dockerfile"
   BUILD_CONTEXT="$(git rev-parse --show-toplevel)"
 
+  # Linha atual de VITE_API_URL no Dockerfile (para restaurar depois)
+  ORIGINAL_VITE_LINE=$(grep "VITE_API_URL=" "$DOCKERFILE_PATH")
+
+  if [[ -z "$ORIGINAL_VITE_LINE" ]]; then
+    error "Não foi encontrada a variável VITE_API_URL no Dockerfile. Verifique se o Dockerfile está correto."
+  fi
+
+  info "VITE_API_URL atual no Dockerfile: ${BOLD}${ORIGINAL_VITE_LINE}${NC}"
+  info "Atualizando VITE_API_URL para http://${EC2_PUBLIC_IP}..."
+
+  # Garante restauração do Dockerfile mesmo se o script falhar durante o build
+  trap 'info "Restaurando Dockerfile original..."; sed -i "s|VITE_API_URL=http://[0-9.]*|VITE_API_URL=http://${ORIGINAL_IP_IN_DOCKERFILE}|" "$DOCKERFILE_PATH"; success "Dockerfile restaurado."' EXIT
+
+  # Extrai só o IP que estava no Dockerfile antes de alterar
+  ORIGINAL_IP_IN_DOCKERFILE=$(echo "$ORIGINAL_VITE_LINE" | grep -oP 'http://\K[0-9.]+')
+
+  # Substitui o IP no Dockerfile
+  sed -i "s|VITE_API_URL=http://[0-9.]*|VITE_API_URL=http://${EC2_PUBLIC_IP}|" "$DOCKERFILE_PATH"
+  success "Dockerfile atualizado: VITE_API_URL=http://${EC2_PUBLIC_IP}"
+
+  # ── Build da imagem ───────────────────────────────────────────────────────
+  info "Iniciando build da imagem Docker..."
+
   docker build -t "${ECR_REPO}:${COMMIT_HASH}" -f "$DOCKERFILE_PATH" "$BUILD_CONTEXT"
   success "Build concluído."
+
+  # ── Restaurar Dockerfile após o build ─────────────────────────────────────
+  trap - EXIT
+  info "Restaurando Dockerfile original..."
+  sed -i "s|VITE_API_URL=http://[0-9.]*|VITE_API_URL=http://${ORIGINAL_IP_IN_DOCKERFILE}|" "$DOCKERFILE_PATH"
+  success "Dockerfile restaurado para o IP original (${ORIGINAL_IP_IN_DOCKERFILE})."
 
   # ── Tag e push para ECR ───────────────────────────────────────────────────
   ecr_login
@@ -267,6 +344,11 @@ do_rollback() {
   done
 
   echo "────────────────────────────────────────────────────────────────────"
+  echo ""
+  echo -e "${YELLOW}[AVISO]${NC} O rollback não altera o IP da API no frontend."
+  echo -e "        O ${BOLD}VITE_API_URL${NC} (IP público da EC2) foi fixado dentro de cada imagem"
+  echo -e "        no momento em que ela foi buildada. Para corrigir o IP, execute um"
+  echo -e "        novo ${BOLD}deploy${NC} com a instância EC2 do cluster em execução."
   echo ""
 
   # ── Escolha da revisão ────────────────────────────────────────────────────
