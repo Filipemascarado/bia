@@ -162,11 +162,29 @@ do_deploy() {
   read -rp "Confirma o deploy com hash ${COMMIT_HASH} no ambiente ${CLUSTER}? (s/N): " CONFIRM
   [[ "$CONFIRM" =~ ^[sS]$ ]] || { warn "Deploy cancelado."; exit 0; }
 
-  # ── Buscar IP público da EC2 do cluster e injetar no Dockerfile ──────────
-  get_cluster_ec2_ip
-
+  # ── Resolver endpoint de API (ALB DNS ou IP da EC2) ──────────────────────
   DOCKERFILE_PATH="$(git rev-parse --show-toplevel)/Dockerfile"
   BUILD_CONTEXT="$(git rev-parse --show-toplevel)"
+
+  if [[ "$ENV_CHOICE" == "2" ]]; then
+    # Com ALB: usar o DNS do ALB como endpoint — estável e não muda
+    info "Buscando DNS do ALB associado ao cluster ${CLUSTER}..."
+    ALB_DNS=$(aws elbv2 describe-load-balancers \
+      --region "$AWS_REGION" \
+      --query "LoadBalancers[?LoadBalancerName=='bia-alb'].DNSName" \
+      --output text)
+
+    if [[ -z "$ALB_DNS" || "$ALB_DNS" == "None" ]]; then
+      error "Não foi possível obter o DNS do ALB 'bia-alb'. Verifique se o ALB está ativo."
+    fi
+
+    API_ENDPOINT="$ALB_DNS"
+    success "DNS do ALB encontrado: ${BOLD}${API_ENDPOINT}${NC}"
+  else
+    # Sem ALB: usar o IP público da EC2 do cluster
+    get_cluster_ec2_ip
+    API_ENDPOINT="$EC2_PUBLIC_IP"
+  fi
 
   # Linha atual de VITE_API_URL no Dockerfile (para restaurar depois)
   ORIGINAL_VITE_LINE=$(grep "VITE_API_URL=" "$DOCKERFILE_PATH")
@@ -175,18 +193,18 @@ do_deploy() {
     error "Não foi encontrada a variável VITE_API_URL no Dockerfile. Verifique se o Dockerfile está correto."
   fi
 
-  info "VITE_API_URL atual no Dockerfile: ${BOLD}${ORIGINAL_VITE_LINE}${NC}"
-  info "Atualizando VITE_API_URL para http://${EC2_PUBLIC_IP}..."
+  # Extrai o valor original completo (pode ser IP ou DNS) para restaurar depois
+  ORIGINAL_VITE_VALUE=$(echo "$ORIGINAL_VITE_LINE" | grep -oP 'VITE_API_URL=\K.*' | tr -d '"')
+
+  info "VITE_API_URL atual no Dockerfile: ${BOLD}${ORIGINAL_VITE_VALUE}${NC}"
+  info "Atualizando VITE_API_URL para http://${API_ENDPOINT}..."
 
   # Garante restauração do Dockerfile mesmo se o script falhar durante o build
-  trap 'info "Restaurando Dockerfile original..."; sed -i "s|VITE_API_URL=http://[0-9.]*|VITE_API_URL=http://${ORIGINAL_IP_IN_DOCKERFILE}|" "$DOCKERFILE_PATH"; success "Dockerfile restaurado."' EXIT
+  trap 'info "Restaurando Dockerfile original..."; sed -i "s|VITE_API_URL=http://[^ ]*|VITE_API_URL=${ORIGINAL_VITE_VALUE}|" "$DOCKERFILE_PATH"; success "Dockerfile restaurado."' EXIT
 
-  # Extrai só o IP que estava no Dockerfile antes de alterar
-  ORIGINAL_IP_IN_DOCKERFILE=$(echo "$ORIGINAL_VITE_LINE" | grep -oP 'http://\K[0-9.]+')
-
-  # Substitui o IP no Dockerfile
-  sed -i "s|VITE_API_URL=http://[0-9.]*|VITE_API_URL=http://${EC2_PUBLIC_IP}|" "$DOCKERFILE_PATH"
-  success "Dockerfile atualizado: VITE_API_URL=http://${EC2_PUBLIC_IP}"
+  # Substitui o valor no Dockerfile (IP ou DNS anterior → novo endpoint)
+  sed -i "s|VITE_API_URL=http://[^ ]*|VITE_API_URL=http://${API_ENDPOINT}|" "$DOCKERFILE_PATH"
+  success "Dockerfile atualizado: VITE_API_URL=http://${API_ENDPOINT}"
 
   # ── Build da imagem ───────────────────────────────────────────────────────
   info "Iniciando build da imagem Docker..."
@@ -197,8 +215,8 @@ do_deploy() {
   # ── Restaurar Dockerfile após o build ─────────────────────────────────────
   trap - EXIT
   info "Restaurando Dockerfile original..."
-  sed -i "s|VITE_API_URL=http://[0-9.]*|VITE_API_URL=http://${ORIGINAL_IP_IN_DOCKERFILE}|" "$DOCKERFILE_PATH"
-  success "Dockerfile restaurado para o IP original (${ORIGINAL_IP_IN_DOCKERFILE})."
+  sed -i "s|VITE_API_URL=http://[^ ]*|VITE_API_URL=${ORIGINAL_VITE_VALUE}|" "$DOCKERFILE_PATH"
+  success "Dockerfile restaurado para o valor original (${ORIGINAL_VITE_VALUE})."
 
   # ── Tag e push para ECR ───────────────────────────────────────────────────
   ecr_login
