@@ -59,7 +59,7 @@ const AddTask = ({ onAdd }) => {
       </div>
       
       <button type="submit" className="btn btn-block success">
-        Adicionar Nova Tarefa - deploy com ia no Kiro Cli
+        Adicionar Nova Tarefa - com ALB
       </button>
       
       <Modal
