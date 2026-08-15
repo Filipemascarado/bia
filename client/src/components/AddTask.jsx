@@ -59,7 +59,7 @@ const AddTask = ({ onAdd }) => {
       </div>
       
       <button type="submit" className="btn btn-block success">
-        Adicionar Nova Tarefa - com ALB
+        Adicionar Nova Tarefa - com ALB e pipeline COdeBuilder
       </button>
       
       <Modal
