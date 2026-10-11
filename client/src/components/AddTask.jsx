@@ -59,7 +59,7 @@ const AddTask = ({ onAdd }) => {
       </div>
       
       <button type="submit" className="btn btn-block success">
-        Add Nova Tarefa - deploy com IA
+        Add Nova Tarefa - deploy pelo CodePipeline
       </button>
       
       <Modal
